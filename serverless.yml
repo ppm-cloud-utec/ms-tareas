@@ -64,17 +64,51 @@ custom:
     identitySource: method.request.header.Authorization
 
 functions:
+
   health:
     handler: src/handlers/health.manejar
     events:
-      - http:
-          path: /health
-          method: get
-          cors: true
-          authorizer: ${self:custom.autorizador}
+      - http: { path: "/health", method: get, cors: true, authorizer: "${self:custom.autorizador}" }
 
-  # TODO(fabianbot1331): tus endpoints van aqui. Minimo 5 protegidos.
-  # Copia el bloque de health y cambia path/method/handler.
+  listarTareas:
+    handler: src/handlers/tareas.listar
+    description: Tareas de un proyecto, filtrables por estado
+    events:
+      - http: { path: "/proyectos/{proyecto_id}/tareas", method: get, cors: true, authorizer: "${self:custom.autorizador}" }
+
+  crearTarea:
+    handler: src/handlers/tareas.crear
+    description: Publica tarea.creada con los contadores del proyecto
+    events:
+      - http: { path: "/proyectos/{proyecto_id}/tareas", method: post, cors: true, authorizer: "${self:custom.autorizador}" }
+
+  obtenerTarea:
+    handler: src/handlers/tareas.obtener
+    events:
+      - http: { path: "/proyectos/{proyecto_id}/tareas/{tarea_id}", method: get, cors: true, authorizer: "${self:custom.autorizador}" }
+
+  actualizarTarea:
+    handler: src/handlers/tareas.actualizar
+    events:
+      - http: { path: "/proyectos/{proyecto_id}/tareas/{tarea_id}", method: put, cors: true, authorizer: "${self:custom.autorizador}" }
+
+  completarTarea:
+    handler: src/handlers/tareas.completar
+    description: Publica tarea.completada - el evento clave de la demo
+    events:
+      - http: { path: "/proyectos/{proyecto_id}/tareas/{tarea_id}/completar", method: post, cors: true, authorizer: "${self:custom.autorizador}" }
+
+  resumenProyecto:
+    handler: src/handlers/tareas.resumen
+    description: Contadores y avance de un proyecto
+    events:
+      - http: { path: "/proyectos/{proyecto_id}/resumen", method: get, cors: true, authorizer: "${self:custom.autorizador}" }
+
+  misTareas:
+    handler: src/handlers/tareas.mias
+    description: Las tareas del usuario del token, por el GSI de responsable
+    events:
+      - http: { path: "/mis-tareas", method: get, cors: true, authorizer: "${self:custom.autorizador}" }
 
 resources:
   Resources:
@@ -88,9 +122,26 @@ resources:
             AttributeType: S
           - AttributeName: sk
             AttributeType: S
+          - AttributeName: gsi1pk
+            AttributeType: S
+          - AttributeName: gsi1sk
+            AttributeType: S
         KeySchema:
           # pk = TENANT#<tenant_id>  -> el aislamiento vive en la particion
           - AttributeName: pk
             KeyType: HASH
+          # sk = PROYECTO#<pid>#TAREA#<tid>  -> begins_with trae las tareas de
+          # un proyecto, y #RESUMEN guarda los contadores atomicos
           - AttributeName: sk
             KeyType: RANGE
+        GlobalSecondaryIndexes:
+          # "Mis tareas": un miembro no debe recorrer los 500 proyectos del
+          # tenant para encontrar las 8 que le toca hacer.
+          - IndexName: ix-responsable
+            KeySchema:
+              - AttributeName: gsi1pk
+                KeyType: HASH
+              - AttributeName: gsi1sk
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
