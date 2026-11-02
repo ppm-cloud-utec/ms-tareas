@@ -159,7 +159,10 @@ def crear(event, context):
     total, completadas = _contadores(tenant_id, proyecto_id, delta_total=1)
 
     publicar("tarea.creada", tenant_id, {
-        "proyecto_id": str(proyecto_id),
+        # El contrato dice entero: los consumidores lo usan contra columnas
+        # BIGINT. Dentro de DynamoDB se guarda como cadena, pero eso es un
+        # detalle de ESTE microservicio y no debe filtrarse al evento.
+        "proyecto_id": int(proyecto_id),
         "tarea_id": tarea_id,
         "tipo": tipo,
         # Los dos contadores completos: el worker no acumula, reemplaza.
@@ -218,7 +221,7 @@ def completar(event, context):
     avance = round(100.0 * completadas / total, 2) if total else 0.0
 
     publicar("tarea.completada", tenant_id, {
-        "proyecto_id": str(proyecto_id),
+        "proyecto_id": int(proyecto_id),
         "tarea_id": tarea_id,
         "nombre": tarea["nombre"],
         "tipo": tarea.get("tipo", "tarea"),
