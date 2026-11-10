@@ -71,4 +71,8 @@ def rol_de(event):
 
 
 def cuerpo_de(event):
-    return json.loads(event.get("body") or "{}")
+    try:
+        cuerpo = json.loads(event.get("body") or "{}", parse_float=Decimal)
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+    return cuerpo if isinstance(cuerpo, dict) else None

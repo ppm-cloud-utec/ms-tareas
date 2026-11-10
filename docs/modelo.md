@@ -1,6 +1,6 @@
 # Modelo de datos — ms-tareas
 
-**Motor:** DynamoDB · **Tabla:** `ms-tareas-tareas-dev` (single-table design)
+**Motor:** DynamoDB · **Tabla:** `ms-tareas-tareas-dev` (diseño de tabla única)
 **Facturación:** PAY_PER_REQUEST
 
 ## Claves
@@ -27,20 +27,15 @@ está en la partición, así que una query **no puede** cruzar tenants.
 }
 ```
 
-Lleva dos contadores que se actualizan con `ADD`, que en DynamoDB es **atómico**:
-dos personas completando tareas al mismo tiempo no se pisan.
+Al crear o completar una tarea, una transacción escribe la tarea y el
+resumen juntos. El resumen usa `ADD` con `#total` como alias de `total`.
+En la misma transacción, la tarea guarda un `evento_id` nuevo. DynamoDB
+Streams entrega el cambio ya confirmado al publicador de SNS.
 
-**Por qué importa:** el evento `tarea.completada` viaja con los dos contadores
-completos (`total_tareas` y `tareas_completadas`), no con un "+1". El worker de
-`ms-portafolios` **reemplaza** el porcentaje en vez de acumularlo. Así, si un
-evento se pierde o llega repetido, el avance se corrige solo en el siguiente en
-lugar de quedar desviado para siempre.
-
-Es la diferencia entre un sistema de eventos que aguanta y uno que se
-descuadra a la primera.
-
-> `total` es **palabra reservada** en DynamoDB: en la `UpdateExpression` va
-> aliasada como `#total`. Sin el alias la llamada falla en tiempo de ejecución.
+El publicador lee el resumen con consistencia fuerte y envía el total y
+las completadas en `total_tareas` y `tareas_completadas`. Un reintento usa
+el mismo ID de evento. Las actualizaciones de campos que conservan el
+`evento_id` y las tareas del seed quedan fuera de esta publicación.
 
 ## Item de tarea
 
@@ -62,6 +57,8 @@ descuadra a la primera.
   "creado_en": "2026-09-14T12:00:00+00:00",
   "completado_en": "2026-10-01T09:12:00+00:00",
   "completado_por": "8f14e45f-...",
+  "revision": 2,
+  "evento_id": "3f23178e-...",
   "gsi1pk": "TENANT#t-acme#RESPONSABLE#8f14e45f-...",
   "gsi1sk": "completada#2026-10-02"
 }
@@ -69,10 +66,10 @@ descuadra a la primera.
 
 - `tipo`: `tarea` o `hito`
 - `estado`: `pendiente`, `en_progreso`, `completada`, `bloqueada`, `cancelada`
-- `depende_de`: lista de `tarea_id`. Es una lista, no una FK — DynamoDB no
-  valida referencias y no hace falta para el caso de uso.
-- `responsable_id`: UUID lógico de un usuario de `ms-identidad`, sin validación
-  HTTP (los microservicios son autónomos).
+- `depende_de` contiene una lista de IDs de tareas. Se almacena como dato de planificación.
+- `responsable_id` es el ID lógico de un usuario de `ms-identidad`. En operación, el servicio se mantiene autónomo.
+- `revision` permite detectar escrituras concurrentes. La primera edición de un registro previo inicializa la revisión.
+- `evento_id` identifica la última creación o finalización de la tarea. Es un campo interno.
 
 ## Índice secundario
 
@@ -92,14 +89,18 @@ Es el **único** GSI: el resto de accesos los cubre el diseño de claves.
 | tareas de un proyecto | `Query` con `begins_with` |
 | avance de un proyecto | `GetItem` del item de resumen |
 | mis tareas | `Query` sobre `ix-responsable` |
-| completar una tarea | `UpdateItem` condicional + `ADD` al resumen |
+| completar una tarea | `TransactWriteItems` con revisión condicional y `ADD` al resumen |
 
 ## Idempotencia de la acción de completar
 
-`POST /tareas/{id}/completar` lleva la condición
-`attribute_exists(sk) AND estado <> "completada"`. Si el usuario hace doble clic,
-la segunda llamada devuelve **409** y **no incrementa el contador**. Sin esa
-condición el avance subiría dos veces por una sola tarea.
+`POST /proyectos/{proyecto_id}/tareas/{tarea_id}/completar` comprueba el
+estado y condiciona la escritura a la revisión leída. Si dos solicitudes
+intentan completar la misma tarea, solo una puede confirmar su revisión e
+incrementar el contador. Una nueva solicitud sobre una tarea completada
+recibe `409`. Las ediciones de metadata se permiten después del completado.
+
+Al reasignar, quitar un responsable, cambiar la fecha de fin o cambiar el
+estado, la escritura actualiza también las claves del GSI.
 
 ## Volumen de datos
 
@@ -118,6 +119,6 @@ tareas. Es la misma lógica de perfiles que en `ms-portafolios`.
 
 ```bash
 export TABLA=ms-tareas-tareas-dev
-python seed/generar.py
-python seed/generar.py --contar
+python3.12 seed/generar.py --tabla-identidad ms-identidad-identidad-dev
+python3.12 seed/generar.py --contar
 ```

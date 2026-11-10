@@ -16,9 +16,9 @@ provider:
   environment:
     SERVICIO: ${self:service}
     SNS_TOPIC_ARN: ${cf:infra-compartida-${sls:stage}.SnsEventosArn}
-    TABLA_EVENTOS_PROCESADOS: ${cf:infra-compartida-${sls:stage}.TablaEventosProcesados}
     TABLA: ${self:service}-tareas-${sls:stage}
   # AWS Academy no permite crear roles IAM: se reusa LabRole.
+  # El rol necesita acceso a la tabla, a DynamoDB Streams y a SNS.
   # En una cuenta propia, borra la linea `role:` y descomenta los permisos,
   # que son los minimos que este microservicio necesita.
   iam:
@@ -31,16 +31,10 @@ provider:
   #       Resource: ${cf:infra-compartida-${sls:stage}.SnsEventosArn}
   #     - Effect: Allow
   #       Action:
-  #         - dynamodb:PutItem
-  #       Resource: ${cf:infra-compartida-${sls:stage}.TablaEventosProcesadosArn}
-  #     - Effect: Allow
-  #       Action:
   #         - dynamodb:Query
   #         - dynamodb:GetItem
   #         - dynamodb:PutItem
   #         - dynamodb:UpdateItem
-  #         - dynamodb:DeleteItem
-  #         - dynamodb:BatchWriteItem
   #       Resource:
   #         - arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:service}-tareas-${sls:stage}
   #         - arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:service}-tareas-${sls:stage}/index/*
@@ -50,17 +44,16 @@ package:
   patterns:
     - "!**"
     - "src/**"
+    - "!src/**/__pycache__/**"
 
 plugins:
   - serverless-python-requirements
 
 custom:
   pythonRequirements:
-    # true, no "non-linux": en Linux "non-linux" NO usa Docker y busca un
-    # binario python3.12 local, que no existe (el sistema trae 3.14).
-    # Forzar Docker ademas garantiza que psycopg se compile contra Amazon
-    # Linux, que es donde corre la Lambda.
-    dockerizePip: true
+    # Por defecto se usa Docker, igual que en el repositorio del equipo.
+    # El empaquetado local puede usar Python 3.12 con --param=dockerizePip=false.
+    dockerizePip: ${strToBool(${param:dockerizePip, "true"})}
     slim: true
     # Cache propio por repo. El cache global de ~/.cache lo comparten todos
     # los servicios, y si dos despliegues corren a la vez un contenedor lo
@@ -121,6 +114,21 @@ functions:
     events:
       - http: { path: "/mis-tareas", method: get, cors: true, authorizer: "${self:custom.autorizador}" }
 
+  publicarTareas:
+    handler: src/handlers/publicar_tareas.manejar
+    description: Publica a SNS los eventos de tareas confirmados en DynamoDB
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt Tabla.StreamArn
+          startingPosition: TRIM_HORIZON
+          functionResponseType: ReportBatchItemFailures
+          filterPatterns:
+            - dynamodb:
+                NewImage:
+                  evento_id:
+                    S: [{ exists: true }]
+
 resources:
   Resources:
     Tabla:
@@ -128,6 +136,8 @@ resources:
       Properties:
         TableName: ${self:service}-tareas-${sls:stage}
         BillingMode: PAY_PER_REQUEST
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
         AttributeDefinitions:
           - AttributeName: pk
             AttributeType: S
