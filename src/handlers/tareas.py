@@ -1,141 +1,240 @@
-"""Tareas e hitos. Al completarse, publican el avance del proyecto.
-
-Este es el microservicio que hace visible el EDA en la demo: completar una
-tarea aqui cambia el porcentaje de avance en ms-portafolios sin que el
-frontend llame a ms-portafolios ni los dos microservicios se conozcan.
-"""
+"""API de tareas e hitos, con aislamiento por tenant y avance por proyecto."""
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal, DecimalException
 
 from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.types import DYNAMODB_CONTEXT
 from botocore.exceptions import ClientError
 
 from src import db, roles
-from src.eventos import publicar
-from src.respuesta import cuerpo_de, error, ok, tenant_de, usuario_de
+from src.respuesta import cuerpo_de, error, ok, rol_de, tenant_de, usuario_de
 
 ESTADOS = ("pendiente", "en_progreso", "completada", "bloqueada", "cancelada")
 TIPOS = ("tarea", "hito")
+GESTORES = (roles.PM, roles.PMO, roles.ADMIN)
+CAMPOS = ("nombre", "descripcion", "estado", "responsable_id",
+          "fecha_inicio", "fecha_fin", "horas_estimadas", "depende_de")
+INTERNOS = {"pk", "sk", "gsi1pk", "gsi1sk", "revision", "evento_id"}
 
 
 def _ahora():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _contadores(tenant_id, proyecto_id, delta_total=0, delta_completadas=0):
-    """Actualiza los contadores del proyecto de forma atomica.
+def _publico(item):
+    return {k: v for k, v in item.items() if k not in INTERNOS}
 
-    ADD sobre DynamoDB es atomico: dos personas completando tareas a la vez no
-    se pisan. Devuelve los valores ya actualizados, que son los que viajan en
-    el evento.
-    """
-    r = db.tabla().update_item(
-        Key={"pk": db.pk(tenant_id), "sk": db.sk_resumen(proyecto_id)},
-        # "total" es palabra reservada en DynamoDB: hay que aliasarla con #.
-        UpdateExpression=(
-            "ADD #total :t, completadas :c "
-            "SET proyecto_id = :p, tenant_id = :tid, actualizado_en = :a"
-        ),
-        ExpressionAttributeNames={"#total": "total"},
-        ExpressionAttributeValues={
-            ":t": delta_total,
-            ":c": delta_completadas,
-            ":p": str(proyecto_id),
-            ":tid": tenant_id,
-            ":a": _ahora(),
-        },
-        ReturnValues="ALL_NEW",
-    )
-    item = r["Attributes"]
-    return int(item.get("total", 0)), int(item.get("completadas", 0))
+
+def _id_proyecto_valido(proyecto_id):
+    return (len(proyecto_id) <= 19 and proyecto_id.isascii() and proyecto_id.isdecimal()
+            and 0 < int(proyecto_id) <= 2**63 - 1)
+
+
+def _limite(q):
+    try:
+        limite = int(q.get("limite", 100))
+    except (TypeError, ValueError):
+        return None
+    return min(limite, 300) if limite > 0 else None
+
+
+def _validar(cambios):
+    """Valida los campos antes de construir expresiones de DynamoDB."""
+    nombre = cambios.get("nombre")
+    if "nombre" in cambios and (not isinstance(nombre, str) or not nombre.strip()):
+        return error("NOMBRE_INVALIDO", "El nombre debe ser un texto no vacío")
+    if "descripcion" in cambios and not isinstance(cambios["descripcion"], str):
+        return error("DESCRIPCION_INVALIDA", "La descripción debe ser texto")
+
+    responsable = cambios.get("responsable_id")
+    if responsable is not None and (
+        not isinstance(responsable, str) or not responsable.strip()
+        or len(responsable.encode("utf-8")) > 512
+    ):
+        return error("RESPONSABLE_INVALIDO", "Envía el identificador del responsable o null")
+
+    for campo in ("fecha_inicio", "fecha_fin"):
+        valor = cambios.get(campo)
+        if valor in (None, ""):
+            continue
+        try:
+            if date.fromisoformat(valor).isoformat() != valor:
+                raise ValueError
+        except (TypeError, ValueError):
+            return error("FECHA_INVALIDA", f"{campo} debe tener el formato AAAA-MM-DD")
+
+    if "horas_estimadas" in cambios:
+        horas = cambios["horas_estimadas"]
+        try:
+            if (type(horas) not in (int, Decimal)
+                    or not DYNAMODB_CONTEXT.create_decimal(horas).is_finite() or horas < 0):
+                raise ValueError
+        except (DecimalException, ValueError):
+            return error("HORAS_INVALIDAS", "Las horas deben ser un número no negativo")
+
+    if "depende_de" in cambios:
+        deps = cambios["depende_de"]
+        if not isinstance(deps, list) or any(not isinstance(x, str) or not x for x in deps):
+            return error("DEPENDENCIAS_INVALIDAS", "depende_de debe ser una lista de IDs")
+
+
+def _leer_tarea(tabla, tenant_id, proyecto_id, tarea_id):
+    return tabla.get_item(
+        Key={"pk": db.pk(tenant_id), "sk": db.sk_tarea(proyecto_id, tarea_id)},
+        ConsistentRead=True,
+    ).get("Item")
+
+
+def _no_encontrada(tarea_id):
+    return error("NO_ENCONTRADO", f"No existe la tarea {tarea_id}", 404)
+
+
+def _cambio_tarea(tarea, cambios):
+    """Escribe una revisión y actualiza el índice en la misma operación."""
+    actualizado = tarea | cambios
+    revision = tarea.get("revision")
+    campos = cambios | {"revision": (revision or 0) + 1}
+    responsable = actualizado.get("responsable_id")
+    if responsable:
+        campos["gsi1pk"] = db.gsi_responsable(tarea["tenant_id"], responsable)
+        campos["gsi1sk"] = f"{actualizado['estado']}#{actualizado.get('fecha_fin') or '9999-12-31'}"
+
+    nombres = {f"#{k}": k for k in campos}
+    valores = {f":{k}": v for k, v in campos.items()}
+    expresion = "SET " + ", ".join(f"#{k} = :{k}" for k in campos)
+    if not responsable:
+        expresion += " REMOVE gsi1pk, gsi1sk"
+    condicion = "attribute_exists(sk) AND "
+    if revision is None:
+        condicion += "attribute_not_exists(#revision)"
+    else:
+        condicion += "#revision = :revision_anterior"
+        valores[":revision_anterior"] = revision
+    return {
+        "Key": {"pk": tarea["pk"], "sk": tarea["sk"]},
+        "UpdateExpression": expresion,
+        "ConditionExpression": condicion,
+        "ExpressionAttributeNames": nombres,
+        "ExpressionAttributeValues": valores,
+    }
+
+
+def _progreso(proyecto_id, item):
+    total = int(item.get("total", 0))
+    completadas = int(item.get("completadas", 0))
+    return {
+        "proyecto_id": proyecto_id,
+        "total_tareas": total,
+        "tareas_completadas": completadas,
+        "avance_pct": round(100 * completadas / total, 2) if total else 0.0,
+    }
 
 
 def listar(event, context):
-    """GET /proyectos/{proyecto_id}/tareas?estado=&limite="""
-    tenant_id = tenant_de(event)
+    """GET /proyectos/{proyecto_id}/tareas?estado=&limite=&cursor="""
     proyecto_id = event["pathParameters"]["proyecto_id"]
     q = event.get("queryStringParameters") or {}
-    limite = min(int(q.get("limite", 100)), 300)
+    limite = _limite(q)
+    if limite is None:
+        return error("LIMITE_INVALIDO", "limite debe ser un entero positivo")
+    estado = q.get("estado")
+    if estado and estado not in ESTADOS:
+        return error("ESTADO_INVALIDO", f"Estados válidos: {', '.join(ESTADOS)}")
 
+    pk = db.pk(tenant_de(event))
+    prefijo = db.prefijo_tareas(proyecto_id)
     args = {
-        "KeyConditionExpression": Key("pk").eq(db.pk(tenant_id))
-        & Key("sk").begins_with(db.prefijo_tareas(proyecto_id)),
-        "Limit": limite,
+        "KeyConditionExpression": Key("pk").eq(pk) & Key("sk").begins_with(prefijo),
+        "Limit": max(limite, 100),
     }
-    if q.get("estado"):
+    if estado:
         args["FilterExpression"] = "estado = :e"
-        args["ExpressionAttributeValues"] = {":e": q["estado"]}
+        args["ExpressionAttributeValues"] = {":e": estado}
+    cursor = q.get("cursor")
+    if cursor:
+        if not cursor.startswith(prefijo) or len(cursor.encode("utf-8")) > 1024:
+            return error("CURSOR_INVALIDO", "El cursor debe pertenecer al proyecto")
+        args["ExclusiveStartKey"] = {"pk": pk, "sk": cursor}
 
-    r = db.tabla().query(**args)
-    tareas = [{k: v for k, v in t.items() if k not in ("pk", "sk")}
-              for t in r.get("Items", [])]
+    tabla = db.tabla()
+    tareas = []
+    while True:
+        pagina = tabla.query(**args)
+        espacio = limite - len(tareas)
+        items = pagina["Items"]
+        tareas.extend(_publico(item) for item in items[:espacio])
+        siguiente = pagina.get("LastEvaluatedKey")
+        if len(items) > espacio:
+            siguiente = {"pk": pk, "sk": items[espacio - 1]["sk"]}
+        if len(tareas) == limite or not siguiente:
+            break
+        args["ExclusiveStartKey"] = siguiente
 
-    meta = {"total": r["Count"], "proyecto_id": proyecto_id}
-    if r.get("LastEvaluatedKey"):
-        meta["cursor"] = r["LastEvaluatedKey"]["sk"]
+    meta = {"total": len(tareas), "proyecto_id": proyecto_id}
+    if siguiente:
+        meta["cursor"] = siguiente["sk"]
     return ok(tareas, meta=meta)
 
 
 def mias(event, context):
-    """GET /mis-tareas — usa el GSI por responsable.
-
-    Un miembro de equipo no deberia recorrer los 500 proyectos del tenant para
-    encontrar sus 8 tareas.
-    """
-    tenant_id = tenant_de(event)
+    """GET /mis-tareas — usa el GSI por responsable."""
     q = event.get("queryStringParameters") or {}
-    responsable = q.get("responsable_id") or usuario_de(event)
+    limite = _limite(q)
+    if limite is None:
+        return error("LIMITE_INVALIDO", "limite debe ser un entero positivo")
+
+    usuario = usuario_de(event)
+    responsable = q.get("responsable_id") or usuario
+    if responsable != usuario and rol_de(event) not in GESTORES:
+        return error("ROL_INSUFICIENTE", "Solo puedes consultar tus propias tareas", 403)
 
     r = db.tabla().query(
         IndexName="ix-responsable",
-        KeyConditionExpression=Key("gsi1pk").eq(
-            db.gsi_responsable(tenant_id, responsable)),
-        Limit=min(int(q.get("limite", 100)), 300),
+        KeyConditionExpression=Key("gsi1pk").eq(db.gsi_responsable(tenant_de(event), responsable)),
+        Limit=limite,
     )
-    tareas = [{k: v for k, v in t.items()
-               if k not in ("pk", "sk", "gsi1pk", "gsi1sk")}
-              for t in r.get("Items", [])]
-    return ok(tareas, meta={"total": r["Count"], "responsable_id": responsable})
+    # Excluye datos antiguos que aún conservan el índice tras quitar al responsable.
+    tareas = [_publico(t) for t in r["Items"] if t.get("responsable_id") == responsable]
+    return ok(tareas, meta={"total": len(tareas), "responsable_id": responsable})
 
 
 def obtener(event, context):
-    """GET /proyectos/{proyecto_id}/tareas/{tarea_id}"""
     p = event["pathParameters"]
-    item = db.tabla().get_item(Key={
-        "pk": db.pk(tenant_de(event)),
-        "sk": db.sk_tarea(p["proyecto_id"], p["tarea_id"]),
-    }).get("Item")
-
-    if not item:
-        return error("NO_ENCONTRADO", f"No existe la tarea {p['tarea_id']}", 404)
-    for c in ("pk", "sk", "gsi1pk", "gsi1sk"):
-        item.pop(c, None)
-    return ok(item)
+    item = _leer_tarea(db.tabla(), tenant_de(event), p["proyecto_id"], p["tarea_id"])
+    return ok(_publico(item)) if item else _no_encontrada(p["tarea_id"])
 
 
 def crear(event, context):
-    """POST /proyectos/{proyecto_id}/tareas — publica tarea.creada."""
-    negado = roles.exige(event, roles.PM, roles.PMO, roles.ADMIN)
+    """POST /proyectos/{proyecto_id}/tareas — genera tarea.creada."""
+    negado = roles.exige(event, *GESTORES)
     if negado:
         return negado
 
     tenant_id = tenant_de(event)
     proyecto_id = event["pathParameters"]["proyecto_id"]
+    if not _id_proyecto_valido(proyecto_id):
+        return error("PROYECTO_INVALIDO", "proyecto_id debe ser un entero positivo de 64 bits")
     c = cuerpo_de(event)
-
-    if not c.get("nombre"):
+    if c is None:
+        return error("JSON_INVALIDO", "Envía un objeto JSON")
+    if "nombre" not in c:
         return error("DATOS_INCOMPLETOS", "Falta el nombre de la tarea")
     tipo = c.get("tipo", "tarea")
     if tipo not in TIPOS:
-        return error("TIPO_INVALIDO", f"Tipos validos: {', '.join(TIPOS)}")
+        return error("TIPO_INVALIDO", f"Tipos válidos: {', '.join(TIPOS)}")
+    invalido = _validar(c)
+    if invalido:
+        return invalido
 
     tarea_id = str(uuid.uuid4())
     responsable = c.get("responsable_id")
+    ahora = _ahora()
     item = {
         "pk": db.pk(tenant_id),
         "sk": db.sk_tarea(proyecto_id, tarea_id),
         "tarea_id": tarea_id,
-        "proyecto_id": str(proyecto_id),
+        "proyecto_id": proyecto_id,
         "tenant_id": tenant_id,
         "nombre": c["nombre"].strip(),
         "descripcion": c.get("descripcion", ""),
@@ -145,169 +244,110 @@ def crear(event, context):
         "fecha_inicio": c.get("fecha_inicio"),
         "fecha_fin": c.get("fecha_fin"),
         "horas_estimadas": c.get("horas_estimadas", 0),
-        # Los ids de las tareas de las que depende. Es una lista, no FK:
-        # DynamoDB no valida referencias y no hace falta para el caso de uso.
         "depende_de": c.get("depende_de", []),
-        "creado_en": _ahora(),
+        "creado_en": ahora,
         "creado_por": usuario_de(event),
+        "revision": 1,
+        "evento_id": str(uuid.uuid4()),
     }
     if responsable:
         item["gsi1pk"] = db.gsi_responsable(tenant_id, responsable)
         item["gsi1sk"] = f"pendiente#{c.get('fecha_fin') or '9999-12-31'}"
 
-    db.tabla().put_item(Item=item)
-    total, completadas = _contadores(tenant_id, proyecto_id, delta_total=1)
-
-    publicar("tarea.creada", tenant_id, {
-        # El contrato dice entero: los consumidores lo usan contra columnas
-        # BIGINT. Dentro de DynamoDB se guarda como cadena, pero eso es un
-        # detalle de ESTE microservicio y no debe filtrarse al evento.
-        "proyecto_id": int(proyecto_id),
-        "tarea_id": tarea_id,
-        "tipo": tipo,
-        # Los dos contadores completos: el worker no acumula, reemplaza.
-        "total_tareas": total,
-        "tareas_completadas": completadas,
-    })
-
-    for c_ in ("pk", "sk", "gsi1pk", "gsi1sk"):
-        item.pop(c_, None)
-    return ok(item, estado=201)
+    tabla = db.tabla()
+    db.escribir_con_resumen(
+        tabla, {"Put": {"Item": item, "ConditionExpression": "attribute_not_exists(sk)"}},
+        tenant_id, proyecto_id, ahora, delta_total=1,
+    )
+    return ok(_publico(item), estado=201)
 
 
 def completar(event, context):
-    """POST /proyectos/{proyecto_id}/tareas/{tarea_id}/completar
-
-    EL MOMENTO CLAVE DE LA DEMO: esto recalcula el avance del proyecto en
-    ms-portafolios por evento, sin que nadie llame a nadie.
-    """
+    """POST /proyectos/{proyecto_id}/tareas/{tarea_id}/completar."""
     tenant_id = tenant_de(event)
     p = event["pathParameters"]
     proyecto_id, tarea_id = p["proyecto_id"], p["tarea_id"]
-
-    try:
-        # La condicion evita contar dos veces la misma tarea si el usuario
-        # hace doble clic: solo pasa si NO estaba ya completada.
-        r = db.tabla().update_item(
-            Key={"pk": db.pk(tenant_id), "sk": db.sk_tarea(proyecto_id, tarea_id)},
-            UpdateExpression=(
-                "SET estado = :completada, completado_en = :ahora, "
-                "completado_por = :quien"
-            ),
-            ConditionExpression=(
-                "attribute_exists(sk) AND estado <> :completada"
-            ),
-            ExpressionAttributeValues={
-                ":completada": "completada",
-                ":ahora": _ahora(),
-                ":quien": usuario_de(event),
-            },
-            ReturnValues="ALL_NEW",
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
-        # Puede ser que no exista o que ya estuviera completada: hay que mirar.
-        existe = db.tabla().get_item(Key={
-            "pk": db.pk(tenant_id),
-            "sk": db.sk_tarea(proyecto_id, tarea_id),
-        }).get("Item")
-        if not existe:
-            return error("NO_ENCONTRADO", f"No existe la tarea {tarea_id}", 404)
+    if not _id_proyecto_valido(proyecto_id):
+        return error("PROYECTO_INVALIDO", "proyecto_id debe ser un entero positivo de 64 bits")
+    tabla = db.tabla()
+    tarea = _leer_tarea(tabla, tenant_id, proyecto_id, tarea_id)
+    if not tarea:
+        return _no_encontrada(tarea_id)
+    usuario = usuario_de(event)
+    if tarea.get("responsable_id") != usuario and rol_de(event) not in GESTORES:
+        return error("ROL_INSUFICIENTE", "Solo puedes completar tus propias tareas", 403)
+    if tarea["estado"] == "completada":
         return error("YA_COMPLETADA", "La tarea ya estaba completada", 409)
 
-    tarea = r["Attributes"]
-    total, completadas = _contadores(tenant_id, proyecto_id, delta_completadas=1)
-    avance = round(100.0 * completadas / total, 2) if total else 0.0
+    ahora = _ahora()
+    cambios = {
+        "estado": "completada", "completado_en": ahora, "completado_por": usuario,
+        "evento_id": str(uuid.uuid4()),
+    }
+    try:
+        db.escribir_con_resumen(
+            tabla, {"Update": _cambio_tarea(tarea, cambios)},
+            tenant_id, proyecto_id, ahora, delta_completadas=1,
+        )
+    except ClientError as e:
+        razones = e.response.get("CancellationReasons") or []
+        if (e.response["Error"]["Code"] != "TransactionCanceledException"
+                or not razones or razones[0]["Code"] != "ConditionalCheckFailed"):
+            raise
+        actual = _leer_tarea(tabla, tenant_id, proyecto_id, tarea_id)
+        if actual and actual["estado"] == "completada":
+            return error("YA_COMPLETADA", "La tarea ya estaba completada", 409)
+        return error("TAREA_MODIFICADA", "La tarea cambió. Vuelve a intentar", 409)
 
-    publicar("tarea.completada", tenant_id, {
-        "proyecto_id": int(proyecto_id),
-        "tarea_id": tarea_id,
-        "nombre": tarea["nombre"],
-        "tipo": tarea.get("tipo", "tarea"),
-        "total_tareas": total,
-        "tareas_completadas": completadas,
-        "avance_pct": avance,
-    })
-
-    for c in ("pk", "sk", "gsi1pk", "gsi1sk"):
-        tarea.pop(c, None)
     return ok({
-        "tarea": tarea,
-        "proyecto": {
-            "proyecto_id": str(proyecto_id),
-            "total_tareas": total,
-            "tareas_completadas": completadas,
-            "avance_pct": avance,
-        },
+        "tarea": _publico(tarea | cambios),
+        "proyecto": _progreso(proyecto_id, db.leer_resumen(tabla, tenant_id, proyecto_id)),
     })
 
 
 def actualizar(event, context):
-    """PUT /proyectos/{proyecto_id}/tareas/{tarea_id}"""
+    negado = roles.exige(event, *GESTORES)
+    if negado:
+        return negado
+
     tenant_id = tenant_de(event)
     p = event["pathParameters"]
     c = cuerpo_de(event)
-
-    permitidos = ("nombre", "descripcion", "estado", "responsable_id",
-                  "fecha_inicio", "fecha_fin", "horas_estimadas", "depende_de")
-    cambios = {k: c[k] for k in permitidos if k in c}
+    if c is None:
+        return error("JSON_INVALIDO", "Envía un objeto JSON")
+    cambios = {k: c[k] for k in CAMPOS if k in c}
     if not cambios:
-        return error("SIN_CAMBIOS", f"Envia alguno de: {', '.join(permitidos)}")
+        return error("SIN_CAMBIOS", f"Envía alguno de: {', '.join(CAMPOS)}")
     if cambios.get("estado") == "completada":
-        return error("USA_COMPLETAR",
-                     "Para completar usa POST /tareas/{id}/completar, "
-                     "que publica el evento y recalcula el avance")
+        return error("USA_COMPLETAR", "Para completar usa POST en la ruta /completar")
     if "estado" in cambios and cambios["estado"] not in ESTADOS:
-        return error("ESTADO_INVALIDO", f"Estados validos: {', '.join(ESTADOS)}")
+        return error("ESTADO_INVALIDO", f"Estados válidos: {', '.join(ESTADOS)}")
+    invalido = _validar(cambios)
+    if invalido:
+        return invalido
+    if "nombre" in cambios:
+        cambios["nombre"] = cambios["nombre"].strip()
 
-    expr = ", ".join(f"{k} = :{k}" for k in cambios)
-    valores = {f":{k}": v for k, v in cambios.items()}
-
-    # Si cambia el responsable hay que mover la clave del GSI
-    if "responsable_id" in cambios and cambios["responsable_id"]:
-        expr += ", gsi1pk = :g"
-        valores[":g"] = db.gsi_responsable(tenant_id, cambios["responsable_id"])
+    tabla = db.tabla()
+    tarea = _leer_tarea(tabla, tenant_id, p["proyecto_id"], p["tarea_id"])
+    if not tarea:
+        return _no_encontrada(p["tarea_id"])
+    if "estado" in cambios and tarea["estado"] == "completada":
+        return error("YA_COMPLETADA", "El estado de una tarea completada es final", 409)
 
     try:
-        r = db.tabla().update_item(
-            Key={"pk": db.pk(tenant_id),
-                 "sk": db.sk_tarea(p["proyecto_id"], p["tarea_id"])},
-            UpdateExpression=f"SET {expr}",
-            ExpressionAttributeValues=valores,
-            ConditionExpression="attribute_exists(sk)",
-            ReturnValues="ALL_NEW",
-        )
+        r = tabla.update_item(**_cambio_tarea(tarea, cambios), ReturnValues="ALL_NEW")
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return error("NO_ENCONTRADO", f"No existe la tarea {p['tarea_id']}", 404)
+            return error("TAREA_MODIFICADA", "La tarea cambió. Vuelve a intentar", 409)
         raise
-
-    tarea = r["Attributes"]
-    for k in ("pk", "sk", "gsi1pk", "gsi1sk"):
-        tarea.pop(k, None)
-    return ok(tarea)
+    return ok(_publico(r["Attributes"]))
 
 
 def resumen(event, context):
-    """GET /proyectos/{proyecto_id}/resumen — los contadores y el avance."""
-    tenant_id = tenant_de(event)
     proyecto_id = event["pathParameters"]["proyecto_id"]
-
-    item = db.tabla().get_item(Key={
-        "pk": db.pk(tenant_id), "sk": db.sk_resumen(proyecto_id)
-    }).get("Item")
-
-    if not item:
-        return ok({"proyecto_id": proyecto_id, "total_tareas": 0,
-                   "tareas_completadas": 0, "avance_pct": 0.0})
-
-    total = int(item.get("total", 0))
-    completadas = int(item.get("completadas", 0))
-    return ok({
-        "proyecto_id": proyecto_id,
-        "total_tareas": total,
-        "tareas_completadas": completadas,
-        "avance_pct": round(100.0 * completadas / total, 2) if total else 0.0,
-        "actualizado_en": item.get("actualizado_en"),
-    })
+    item = db.leer_resumen(db.tabla(), tenant_de(event), proyecto_id)
+    datos = _progreso(proyecto_id, item)
+    if item:
+        datos["actualizado_en"] = item.get("actualizado_en")
+    return ok(datos)
