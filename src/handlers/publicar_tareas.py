@@ -42,6 +42,5 @@ def manejar(event, context):
                          tarea["evento_id"], tarea["creado_en"])
         except Exception:
             logger.exception("Error publicando el evento %s", tarea["evento_id"])
-            # Lambda reintenta desde este registro y conserva el orden del lote.
             return {"batchItemFailures": [{"itemIdentifier": cambio["SequenceNumber"]}]}
     return {"batchItemFailures": []}

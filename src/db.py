@@ -1,17 +1,4 @@
-"""Acceso a DynamoDB. Single-table design con aislamiento por particion.
-
-Claves:
-  Tarea    pk = "TENANT#<tid>"  sk = "PROYECTO#<pid>#TAREA#<tarea_id>"
-  Resumen  pk = "TENANT#<tid>"  sk = "PROYECTO#<pid>#RESUMEN"
-
-El sk compuesto permite traer todas las tareas de un proyecto con un
-begins_with, sin indices ni scans.
-
-El item de RESUMEN lleva contadores atomicos (total y completadas). Es lo que
-hace posible publicar el avance correcto en el evento: si el worker de
-ms-portafolios tuviera que acumular +1 por su cuenta, un evento perdido o
-repetido desviaria el porcentaje para siempre. Aqui el numero viaja completo.
-"""
+"""Acceso a DynamoDB."""
 import os
 import random
 import time
@@ -44,9 +31,7 @@ def prefijo_tareas(proyecto_id):
 
 
 def gsi_responsable(tenant_id, responsable_id):
-    """Clave del GSI 'mis tareas'. Un miembro necesita ver lo suyo sin recorrer
-    todos los proyectos del tenant.
-    """
+    """Clave del GSI 'mis tareas'."""
     return f"TENANT#{tenant_id}#RESPONSABLE#{responsable_id}"
 
 

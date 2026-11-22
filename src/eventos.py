@@ -10,11 +10,7 @@ ORIGEN = os.environ["SERVICIO"]
 
 
 def publicar(tipo, tenant_id, datos, evento_id, ocurrido_en):
-    """Publica un evento. Llamar SIEMPRE despues de confirmar la escritura en BD.
-
-    Los atributos de mensaje son los que usan las filter policies de las colas
-    SQS para quedarse solo con lo que les interesa.
-    """
+    """Publica un evento."""
     evento = {
         "evento_id": evento_id,
         "tipo": tipo,

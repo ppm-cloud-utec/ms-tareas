@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Carga 30,000 tareas y 775 resúmenes, repartidos en 3 tenants.
-
-    python seed/generar.py            # los 3 tenants
-    python seed/generar.py --contar
-
-Los perfiles son muy distintos a proposito, igual que en ms-portafolios:
-Acme reparte sus 10,000 tareas entre 500 obras (20 por obra); Initech las
-concentra en 25 desarrollos de producto (400 por desarrollo). Esa diferencia
-es la que hace que el multi-tenancy se vea real en la demo.
-"""
+"""Carga 30,000 tareas y 775 resúmenes, repartidos en 3 tenants."""
 import os
 import uuid
 import random

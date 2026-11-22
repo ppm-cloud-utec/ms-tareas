@@ -1,14 +1,9 @@
 service: ms-tareas
 
-# Se usa la v3 a proposito: la v4 exige una cuenta de serverless.com y un
-# SERVERLESS_ACCESS_KEY para cada deploy. La v3 solo necesita credenciales
-# de AWS, que es lo unico que da el Learner Lab.
 frameworkVersion: "3"
 
 provider:
   name: aws
-  # Usa la API Gateway unica de infra-compartida en vez de crear una
-  # propia. Todas las rutas de este servicio viven bajo /tareas.
   apiGateway:
     restApiId: ${cf:infra-compartida-${sls:stage}.ApiId}
     restApiRootResourceId: ${cf:infra-compartida-${sls:stage}.ApiRootResourceId}
@@ -22,28 +17,8 @@ provider:
     SERVICIO: ${self:service}
     SNS_TOPIC_ARN: ${cf:infra-compartida-${sls:stage}.SnsEventosArn}
     TABLA: ${self:service}-tareas-${sls:stage}
-  # AWS Academy no permite crear roles IAM: se reusa LabRole.
-  # El rol necesita acceso a la tabla, a DynamoDB Streams y a SNS.
-  # En una cuenta propia, borra la linea `role:` y descomenta los permisos,
-  # que son los minimos que este microservicio necesita.
   iam:
     role: arn:aws:iam::${aws:accountId}:role/LabRole
-    # role:
-    #   statements:
-  #     - Effect: Allow
-  #       Action:
-  #         - sns:Publish
-  #       Resource: ${cf:infra-compartida-${sls:stage}.SnsEventosArn}
-  #     - Effect: Allow
-  #       Action:
-  #         - dynamodb:Query
-  #         - dynamodb:GetItem
-  #         - dynamodb:PutItem
-  #         - dynamodb:UpdateItem
-  #       Resource:
-  #         - arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:service}-tareas-${sls:stage}
-  #         - arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:service}-tareas-${sls:stage}/index/*
-  #
 package:
   individually: false
   patterns:
@@ -56,16 +31,10 @@ plugins:
 
 custom:
   pythonRequirements:
-    # Por defecto se usa Docker, igual que en el repositorio del equipo.
-    # El empaquetado local puede usar Python 3.12 con --param=dockerizePip=false.
     dockerizePip: ${strToBool(${param:dockerizePip, "true"})}
     slim: true
-    # Cache propio por repo. El cache global de ~/.cache lo comparten todos
-    # los servicios, y si dos despliegues corren a la vez un contenedor lo
-    # deja en root:root mientras el otro lo lee -> EACCES.
     cacheLocation: ./.serverless-cache
   autorizador:
-    # Registrado una sola vez en la API compartida (infra-compartida).
     type: CUSTOM
     authorizerId: ${cf:infra-compartida-${sls:stage}.AutorizadorApiId}
 
@@ -150,16 +119,11 @@ resources:
           - AttributeName: gsi1sk
             AttributeType: S
         KeySchema:
-          # pk = TENANT#<tenant_id>  -> el aislamiento vive en la particion
           - AttributeName: pk
             KeyType: HASH
-          # sk = PROYECTO#<pid>#TAREA#<tid>  -> begins_with trae las tareas de
-          # un proyecto, y #RESUMEN guarda los contadores atomicos
           - AttributeName: sk
             KeyType: RANGE
         GlobalSecondaryIndexes:
-          # "Mis tareas": un miembro no debe recorrer los 500 proyectos del
-          # tenant para encontrar las 8 que le toca hacer.
           - IndexName: ix-responsable
             KeySchema:
               - AttributeName: gsi1pk
@@ -168,5 +132,4 @@ resources:
                 KeyType: RANGE
             Projection:
               ProjectionType: ALL
-
 
