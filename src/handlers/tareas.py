@@ -278,6 +278,11 @@ def completar(event, context):
         return error("ROL_INSUFICIENTE", "Solo puedes completar tus propias tareas", 403)
     if tarea["estado"] == "completada":
         return error("YA_COMPLETADA", "La tarea ya estaba completada", 409)
+    # Una tarea cancelada no se hizo: completarla sumaria 1 a las completadas
+    # del resumen y el avance del proyecto subiria por trabajo que no existio.
+    if tarea["estado"] == "cancelada":
+        return error("TAREA_CANCELADA",
+                     "La tarea esta cancelada; reabrela antes de completarla", 409)
 
     ahora = _ahora()
     cambios = {
